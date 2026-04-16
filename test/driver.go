@@ -10,16 +10,17 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/hydrolix/sqlds/v5"
+
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
-	"github.com/grafana/sqlds/v5"
-	"github.com/grafana/sqlds/v5/mock"
+	"github.com/hydrolix/sqlds/v5/mock"
 )
 
 var registered = map[string]*SqlHandler{}
 
 // NewDriver creates and registers a new test datasource driver
-func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts DriverOpts, macros sqlds.Macros) (TestDS, *SqlHandler) {
+func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts DriverOpts) (TestDS, *SqlHandler) {
 	if registered[name] == nil {
 		handler := NewDriverHandler(dbdata, opts)
 		registered[name] = &handler
@@ -34,16 +35,14 @@ func NewDriver(name string, dbdata Data, converters []sqlutil.Converter, opts Dr
 			return sql.Open(name, "")
 		},
 		converters,
-		macros,
 	), registered[name]
 }
 
 // NewTestDS creates a new test datasource driver
-func NewTestDS(openDBfn func(msg json.RawMessage) (*sql.DB, error), converters []sqlutil.Converter, macros sqlds.Macros) TestDS {
+func NewTestDS(openDBfn func(msg json.RawMessage) (*sql.DB, error), converters []sqlutil.Converter) TestDS {
 	return TestDS{
 		openDBfn:   openDBfn,
 		converters: converters,
-		macros:     macros,
 	}
 }
 
@@ -148,7 +147,6 @@ type Column struct {
 type TestDS struct {
 	openDBfn   func(msg json.RawMessage) (*sql.DB, error)
 	converters []sqlutil.Converter
-	macros     sqlds.Macros
 	sqlds.Driver
 }
 
@@ -170,11 +168,6 @@ func (s TestDS) Settings(ctx context.Context, config backend.DataSourceInstanceS
 		return sqlds.DriverSettings{}
 	}
 	return settings
-}
-
-// Macros - Macros for the test database
-func (s TestDS) Macros() sqlds.Macros {
-	return s.macros
 }
 
 // Converters - Converters for the test database

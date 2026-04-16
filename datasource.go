@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"net/http"
 	"os"
 	"runtime/debug"
@@ -14,13 +15,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
-
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
-	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/resource/httpadapter"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 )
 
 const defaultKeySuffix = "default"
@@ -28,13 +27,8 @@ const defaultRowLimit = int64(-1)
 const envRowLimit = "GF_DATAPROXY_ROW_LIMIT"
 
 var (
-	ErrorMissingMultipleConnectionsConfig = backend.PluginError(errors.New("received connection arguments but the feature is not enabled"))
-	ErrorMissingDBConnection              = backend.PluginError(errors.New("unable to get default db connection"))
-	HeaderKey                             = "grafana-http-headers"
-	// Deprecated: ErrorMissingMultipleConnectionsConfig should be used instead
-	MissingMultipleConnectionsConfig = ErrorMissingMultipleConnectionsConfig
-	// Deprecated: ErrorMissingDBConnection should be used instead
-	MissingDBConnection = ErrorMissingDBConnection
+	HeaderKey                 = "grafana-http-headers"
+	ErrorParsingMacroBrackets = errors.New("failed to parse macro arguments (missing close bracket?)")
 )
 
 func defaultKey(datasourceUID string) string {
@@ -51,74 +45,54 @@ type dbConnection struct {
 	settings backend.DataSourceInstanceSettings
 }
 
-type SQLDatasource struct {
-	Completable
+type HydrolixDatasource struct {
 	backend.CallResourceHandler
-	connector                 *Connector
-	CustomRoutes              map[string]func(http.ResponseWriter, *http.Request)
-	metrics                   Metrics
-	EnableMultipleConnections bool
+	Connector    Connector
+	ID           string
+	Interpolator Interpolator
+	metrics      Metrics
 	// EnableRowLimit: enables using the dataproxy.row_limit setting to limit the number of rows returned by the query
 	// https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/#row_limit
 	EnableRowLimit bool
 	rowLimit       int64
-	// PreCheckHealth (optional). Performs custom health check before the Connect method
-	PreCheckHealth func(ctx context.Context, req *backend.CheckHealthRequest) *backend.CheckHealthResult
-	// PostCheckHealth (optional).Performs custom health check after the Connect method
-	PostCheckHealth func(ctx context.Context, req *backend.CheckHealthRequest) *backend.CheckHealthResult
-	// ResourceMiddleware (optional). Allows interception to CallResource before it is passed to sqlds
-	ResourceMiddleware func(next backend.CallResourceHandler) backend.CallResourceHandler
 }
 
 // NewDatasource creates a new `SQLDatasource`.
 // It uses the provided settings argument to call the ds.Driver to connect to the SQL server
-func (ds *SQLDatasource) NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
-	conn, err := NewConnector(ctx, ds.driver(), settings, ds.EnableMultipleConnections)
-	if err != nil {
-		return nil, backend.DownstreamError(err)
-	}
-
-	ds.connector = conn
-	mux := http.NewServeMux()
-	err = ds.registerRoutes(mux)
-	if err != nil {
-		return nil, backend.PluginError(err)
-	}
-
-	ds.CallResourceHandler = httpadapter.New(mux)
-	if ds.ResourceMiddleware != nil {
-		ds.CallResourceHandler = ds.ResourceMiddleware(ds.CallResourceHandler)
-	}
+func (ds *HydrolixDatasource) NewDatasource(ctx context.Context, settings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
+	ds.Interpolator = NewInterpolator(ds)
+	ds.ID = settings.UID
 
 	ds.metrics = NewMetrics(settings.Name, settings.Type, EndpointQuery)
 
-	ds.rowLimit = ds.newRowLimit(ctx, conn)
+	ds.rowLimit = ds.newRowLimit(ctx, ds.Connector)
 
 	return ds, nil
 }
 
-// NewDatasource initializes the Datasource wrapper and instance manager
-func NewDatasource(c Driver) *SQLDatasource {
-	return &SQLDatasource{
-		connector: &Connector{driver: c},
+func (ds *HydrolixDatasource) RegisterRoutes(customRoutes map[string]func(http.ResponseWriter, *http.Request)) {
+	mux := http.NewServeMux()
+	for route, handler := range customRoutes {
+		mux.HandleFunc(route, handler)
 	}
+
+	ds.CallResourceHandler = httpadapter.New(mux)
 }
 
 // Dispose cleans up datasource instance resources.
 // Note: Called when testing and saving a datasource
-func (ds *SQLDatasource) Dispose() {
-	ds.connector.Dispose()
+func (ds *HydrolixDatasource) Dispose() {
+	ds.Connector.Dispose()
 }
 
 // QueryData creates the Responses list and executes each query
-func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	headers := req.GetHTTPHeaders()
+func (ds *HydrolixDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 
+	headers := req.GetHTTPHeaders()
 	var (
 		response = NewResponse(backend.NewQueryDataResponse())
 		wg       = sync.WaitGroup{}
 	)
-
 	wg.Add(len(req.Queries))
 
 	if queryDataMutator, ok := ds.driver().(QueryDataMutator); ok {
@@ -172,9 +146,7 @@ func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRe
 			})
 		}(q)
 	}
-
 	wg.Wait()
-
 	errs := ds.errors(response)
 	if ds.DriverSettings().Errors {
 		return response.Response(), errs
@@ -183,13 +155,14 @@ func (ds *SQLDatasource) QueryData(ctx context.Context, req *backend.QueryDataRe
 	return response.Response(), nil
 }
 
-func (ds *SQLDatasource) GetDBFromQuery(ctx context.Context, q *Query) (*sql.DB, error) {
-	_, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
+func (ds *HydrolixDatasource) GetDBFromQuery(ctx context.Context, q *sqlutil.Query) (*sql.DB, error) {
+
+	_, dbConn, err := ds.Connector.GetConnectionFromQuery(ctx, q)
 	return dbConn.db, err
 }
 
 // handleQuery will call query, and attempt to reconnect if the query failed
-func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery, headers http.Header) (data.Frames, error) {
+func (ds *HydrolixDatasource) handleQuery(ctx context.Context, req backend.DataQuery, headers http.Header) (data.Frames, error) {
 	if queryMutator, ok := ds.driver().(QueryMutator); ok {
 		ctx, req = queryMutator.MutateQuery(ctx, req)
 	}
@@ -200,10 +173,13 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 		return nil, err
 	}
 
-	// Apply supported macros to the query
-	q.RawSQL, err = Interpolate(ds.driver(), q)
+	hdxQuery, err := GetHdxQuery(req, headers, nil, nil)
 	if err != nil {
-		if errors.Is(err, sqlutil.ErrorBadArgumentCount) || err.Error() == ErrorParsingMacroBrackets.Error() {
+		return nil, err
+	}
+	q.RawSQL, err = ds.Interpolator.Interpolate(ctx, hdxQuery)
+	if err != nil {
+		if errors.Is(err, sqlutil.ErrorBadArgumentCount) || errors.Is(err, ErrorParsingMacroBrackets) {
 			err = backend.DownstreamError(err)
 		}
 		return sqlutil.ErrorFrameFromQuery(q), fmt.Errorf("%s: %w", "Could not apply macros", err)
@@ -216,7 +192,7 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 	}
 
 	// Retrieve the database connection
-	cacheKey, dbConn, err := ds.connector.GetConnectionFromQuery(ctx, q)
+	cacheKey, dbConn, err := ds.Connector.GetConnectionFromQuery(ctx, q)
 	if err != nil {
 		return sqlutil.ErrorFrameFromQuery(q), err
 	}
@@ -240,7 +216,7 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 
 	// FIXES:
 	//  * Some datasources (snowflake) expire connections or have an authentication token that expires if not used in 1 or 4 hours.
-	//    Because the datasource driver does not include an option for permanent connections, we retry the connection
+	//    Because the datasource Driver does not include an option for permanent connections, we retry the connection
 	//    if the query fails. NOTE: this does not include some errors like "ErrNoRows"
 	dbQuery := NewQuery(dbConn.db, dbConn.settings, ds.driver().Converters(), fillMode, ds.rowLimit)
 	res, err := dbQuery.Run(ctx, q, queryErrorMutator, args...)
@@ -258,8 +234,8 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 		// only retry on messages that contain specific errors
 		if shouldRetry(ds.DriverSettings().RetryOn, err.Error()) {
 			for i := 0; i < ds.DriverSettings().Retries; i++ {
-				backend.Logger.Warn(fmt.Sprintf("query failed: %s. Retrying %d times", err.Error(), i))
-				db, err := ds.connector.Reconnect(ctx, dbConn, q, cacheKey)
+				backend.Logger.Warn("query failed", "error", err.Error(), "retry", i)
+				db, err := ds.Connector.Reconnect(ctx, dbConn, q, cacheKey)
 				if err != nil {
 					return nil, backend.DownstreamError(err)
 				}
@@ -276,7 +252,7 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 				if !shouldRetry(ds.DriverSettings().RetryOn, err.Error()) {
 					return res, err
 				}
-				backend.Logger.Warn(fmt.Sprintf("Retry failed: %s", err.Error()))
+				backend.Logger.Warn("Retry failed", "error", err.Error())
 			}
 		}
 	}
@@ -292,8 +268,8 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 	// allow retries on timeouts
 	if errors.Is(err, context.DeadlineExceeded) {
 		for i := 0; i < ds.DriverSettings().Retries; i++ {
-			backend.Logger.Warn(fmt.Sprintf("connection timed out. retrying %d times", i))
-			db, err := ds.connector.Reconnect(ctx, dbConn, q, cacheKey)
+			backend.Logger.Warn("connection timed out", "retry", i)
+			db, err := ds.Connector.Reconnect(ctx, dbConn, q, cacheKey)
 			if err != nil {
 				continue
 			}
@@ -310,28 +286,27 @@ func (ds *SQLDatasource) handleQuery(ctx context.Context, req backend.DataQuery,
 }
 
 // CheckHealth pings the connected SQL database
-func (ds *SQLDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
+func (ds *HydrolixDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
 	if checkHealthMutator, ok := ds.driver().(CheckHealthMutator); ok {
 		ctx, req = checkHealthMutator.MutateCheckHealth(ctx, req)
 	}
 	healthChecker := &HealthChecker{
-		Connector:       ds.connector,
-		Metrics:         ds.metrics.WithEndpoint(EndpointHealth),
-		PreCheckHealth:  ds.PreCheckHealth,
-		PostCheckHealth: ds.PostCheckHealth,
+		Connector: ds.Connector,
+		Metrics:   ds.metrics.WithEndpoint(EndpointHealth),
 	}
 	return healthChecker.Check(ctx, req)
 }
 
-func (ds *SQLDatasource) DriverSettings() DriverSettings {
-	return ds.connector.driverSettings
+func (ds *HydrolixDatasource) DriverSettings() DriverSettings {
+	return ds.Connector.getDriverSettings()
 }
 
-func (ds *SQLDatasource) driver() Driver {
-	return ds.connector.driver
+func (ds *HydrolixDatasource) driver() Driver {
+
+	return ds.Connector.GetDriver()
 }
 
-func (ds *SQLDatasource) errors(response *Response) error {
+func (ds *HydrolixDatasource) errors(response *Response) error {
 	if response == nil {
 		return nil
 	}
@@ -349,11 +324,11 @@ func (ds *SQLDatasource) errors(response *Response) error {
 	return err
 }
 
-func (ds *SQLDatasource) GetRowLimit() int64 {
+func (ds *HydrolixDatasource) GetRowLimit() int64 {
 	return ds.rowLimit
 }
 
-func (ds *SQLDatasource) SetDefaultRowLimit(limit int64) {
+func (ds *HydrolixDatasource) SetDefaultRowLimit(limit int64) {
 	ds.EnableRowLimit = true
 	ds.rowLimit = limit
 }
@@ -364,13 +339,13 @@ func (ds *SQLDatasource) SetDefaultRowLimit(limit int64) {
 // 2. set via the environment variable
 // 3. set is set on grafana_ini and passed via grafana context
 // 4. default row limit set by SetDefaultRowLimit
-func (ds *SQLDatasource) newRowLimit(ctx context.Context, conn *Connector) int64 {
+func (ds *HydrolixDatasource) newRowLimit(ctx context.Context, conn Connector) int64 {
 	if !ds.EnableRowLimit {
 		return defaultRowLimit
 	}
 
 	// Handles when row limit is set in the datasource configuration page
-	settingsLimit := conn.driverSettings.RowLimit
+	settingsLimit := conn.getDriverSettings().RowLimit
 	if settingsLimit != 0 {
 		return settingsLimit
 	}
