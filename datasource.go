@@ -185,6 +185,10 @@ func (ds *HydrolixDatasource) handleQuery(ctx context.Context, req backend.DataQ
 		return sqlutil.ErrorFrameFromQuery(q), fmt.Errorf("%s: %w", "Could not apply macros", err)
 	}
 
+	if interpolatedMutator, ok := ds.driver().(InterpolatedQueryMutator); ok {
+		ctx, q.RawSQL = interpolatedMutator.MutateInterpolatedQuery(ctx, q.RawSQL)
+	}
+
 	// Apply the default FillMode, overwritting it if the query specifies it
 	fillMode := ds.DriverSettings().FillMode
 	if q.FillMissing != nil {

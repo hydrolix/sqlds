@@ -155,3 +155,66 @@ func newTestDatasource(t *testing.T, driver sqlds.Driver, settings backend.DataS
 
 	return ds
 }
+
+// interpolatedMutatingDriver wraps a TestDS and implements
+// sqlds.InterpolatedQueryMutator so we can observe what handleQuery hands the
+// driver after macro expansion. The captured SQL feeds the test assertions.
+type interpolatedMutatingDriver struct {
+	test.TestDS
+	captured *string
+	rewrite  func(string) string
+}
+
+func (d interpolatedMutatingDriver) MutateInterpolatedQuery(ctx context.Context, sql string) (context.Context, string) {
+	if d.captured != nil {
+		*d.captured = sql
+	}
+	if d.rewrite != nil {
+		sql = d.rewrite(sql)
+	}
+	return ctx, sql
+}
+
+func Test_interpolated_query_mutator_is_invoked_after_macro_expansion(t *testing.T) {
+	cfg := `{"timeout":0,"host":"localhost","port":9000,"protocol":"native"}`
+	settings := backend.DataSourceInstanceSettings{UID: "interp", JSONData: []byte(cfg)}
+
+	base, _ := test.NewDriver("interp", test.Data{}, nil, test.DriverOpts{})
+	captured := ""
+	driver := interpolatedMutatingDriver{TestDS: base, captured: &captured}
+	ds := newTestDatasource(t, driver, settings)
+
+	req := &backend.QueryDataRequest{
+		PluginContext: backend.PluginContext{DataSourceInstanceSettings: &settings},
+		Queries: []backend.DataQuery{{
+			RefID: "A",
+			// $__timeFilter is expanded by the sqlds-default Macros table during
+			// Interpolate. The mutator must see the post-interpolation SQL.
+			JSON: []byte(`{"rawSql":"SELECT * FROM t WHERE $__timeFilter(ts)"}`),
+		}},
+	}
+	_, err := ds.QueryData(context.Background(), req)
+	assert.Nil(t, err)
+	assert.NotContains(t, captured, "$__timeFilter", "mutator must see interpolated SQL")
+	assert.Contains(t, captured, "ts >=", "expected expanded timeFilter expression")
+}
+
+func Test_interpolated_query_mutator_rewrites_sql_before_driver(t *testing.T) {
+	cfg := `{"timeout":0,"host":"localhost","port":9000,"protocol":"native"}`
+	settings := backend.DataSourceInstanceSettings{UID: "interp-rewrite", JSONData: []byte(cfg)}
+
+	base, handler := test.NewDriver("interp-rewrite", test.Data{}, nil, test.DriverOpts{})
+	driver := interpolatedMutatingDriver{
+		TestDS:  base,
+		rewrite: func(sql string) string { return sql + " /* injected */" },
+	}
+	ds := newTestDatasource(t, driver, settings)
+
+	req := &backend.QueryDataRequest{
+		PluginContext: backend.PluginContext{DataSourceInstanceSettings: &settings},
+		Queries:       []backend.DataQuery{{RefID: "A", JSON: []byte(`{"rawSql":"SELECT 1"}`)}},
+	}
+	_, err := ds.QueryData(context.Background(), req)
+	assert.Nil(t, err)
+	assert.Equal(t, 1, handler.State.QueryAttempts, "query must still reach the driver")
+}

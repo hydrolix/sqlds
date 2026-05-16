@@ -61,6 +61,17 @@ type QueryMutator interface {
 	MutateQuery(ctx context.Context, req backend.DataQuery) (context.Context, backend.DataQuery)
 }
 
+// InterpolatedQueryMutator is an additional interface that could be
+// implemented by driver. It mutates the fully interpolated SQL — after
+// Interpolator.Interpolate has expanded all macros — before it reaches the
+// underlying database driver. Use this for rewrites that depend on the final
+// SQL shape (e.g. inspecting a user-supplied SETTINGS clause whose presence
+// the driver cannot observe in MutateQuery because the macros have not yet
+// been expanded).
+type InterpolatedQueryMutator interface {
+	MutateInterpolatedQuery(ctx context.Context, sql string) (context.Context, string)
+}
+
 // QueryArgSetter is an additional interface that could be implemented by driver.
 // This adds the ability to the driver to optionally set query args that are then sent down to the database.
 type QueryArgSetter interface {
